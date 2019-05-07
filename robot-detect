@@ -421,7 +421,7 @@ if (EXECUTE_BLINDING):
 
         for j in range(len(threads)):
             result = threads[j].join()
-            if searching and result and s_vals[j][0] != 5 and s_vals[j][0] != 9:
+            if searching and result:
                 searching = False
                 s0, c0 = s_vals[j]
 
